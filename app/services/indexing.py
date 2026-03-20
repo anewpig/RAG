@@ -5,9 +5,10 @@ from openai import OpenAI
 
 from app.core.config import settings
 from app.schemas.chunk import ChunkDocument
+from app.services.embeddings import embed_texts_local
 
 
-MAX_TOTAL_TOKENS_PER_EMBED_REQUEST = 250000  # 官方上限 300000，這裡保守一點
+MAX_TOTAL_TOKENS_PER_EMBED_REQUEST = 250000
 
 
 def load_chunks_from_jsonl(input_path: Path) -> list[ChunkDocument]:
@@ -49,12 +50,31 @@ def build_embedding_batches(chunks: list[ChunkDocument]) -> list[list[ChunkDocum
     return batches
 
 
-def embed_texts(client: OpenAI, texts: list[str]) -> list[list[float]]:
+def embed_texts_openai(texts: list[str]) -> list[list[float]]:
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY is missing.")
+
+    client = OpenAI(api_key=settings.openai_api_key)
     response = client.embeddings.create(
-        model=settings.embedding_model,
+        model=settings.openai_embedding_model,
         input=texts,
     )
     return [item.embedding for item in response.data]
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    provider = settings.embedding_provider.lower()
+
+    if provider == "local":
+        return embed_texts_local(texts)
+
+    if provider == "openai":
+        return embed_texts_openai(texts)
+
+    raise ValueError(
+        f"Unsupported embedding provider: {settings.embedding_provider}. "
+        "Use 'local' or 'openai'."
+    )
 
 
 def get_chroma_collection():
@@ -63,7 +83,9 @@ def get_chroma_collection():
         name=settings.chroma_collection_name,
         metadata={
             "project": "policylens-rag",
-            "embedding_model": settings.embedding_model,
+            "embedding_provider": settings.embedding_provider,
+            "openai_embedding_model": settings.openai_embedding_model,
+            "local_embedding_model_name": settings.local_embedding_model_name,
         },
     )
     return collection
@@ -77,15 +99,13 @@ def index_chunks_to_chroma() -> dict:
     if not chunks:
         raise ValueError("No chunks found in chunks.jsonl")
 
-    openai_client = OpenAI(api_key=settings.openai_api_key)
     collection = get_chroma_collection()
-
     batches = build_embedding_batches(chunks)
 
     total_indexed = 0
     for batch in batches:
         texts = [chunk.text for chunk in batch]
-        embeddings = embed_texts(openai_client, texts)
+        embeddings = embed_texts(texts)
 
         ids = [chunk.id for chunk in batch]
         documents = [chunk.text for chunk in batch]
@@ -104,7 +124,9 @@ def index_chunks_to_chroma() -> dict:
         "chunk_record_count": len(chunks),
         "indexed_count": total_indexed,
         "batch_count": len(batches),
-        "embedding_model": settings.embedding_model,
+        "embedding_provider": settings.embedding_provider,
+        "openai_embedding_model": settings.openai_embedding_model,
+        "local_embedding_model_name": settings.local_embedding_model_name,
         "collection_name": settings.chroma_collection_name,
         "persist_dir": settings.chroma_persist_dir,
     }

@@ -6,7 +6,11 @@ from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.chunking import build_chunks_from_pages_jsonl
 from app.services.document_ingest import ingest_raw_documents
 from app.services.indexing import index_chunks_to_chroma, get_chroma_collection
-from app.services.retrieval import answer_question, retrieve_chunks
+from app.services.retrieval import (
+    answer_question,
+    retrieve_chunks,
+    is_retrieval_confident,
+)
 
 router = APIRouter()
 
@@ -22,7 +26,9 @@ def health_check():
 @router.get("/config-check")
 def config_check():
     return {
-        "embedding_model": settings.embedding_model,
+        "embedding_provider": settings.embedding_provider,
+        "openai_embedding_model": settings.openai_embedding_model,
+        "local_embedding_model_name": settings.local_embedding_model_name,
         "chat_model": settings.chat_model,
         "chroma_persist_dir": settings.chroma_persist_dir,
         "chroma_collection_name": settings.chroma_collection_name,
@@ -33,6 +39,8 @@ def config_check():
         "retrieval_top_k": settings.retrieval_top_k,
         "generation_max_chunks": settings.generation_max_chunks,
         "generation_max_output_tokens": settings.generation_max_output_tokens,
+        "retrieval_max_distance": settings.retrieval_max_distance,
+        "retrieval_min_results": settings.retrieval_min_results,
         "has_openai_api_key": bool(settings.openai_api_key),
     }
 
@@ -44,9 +52,9 @@ def debug_index_info():
         return {
             "collection_name": settings.chroma_collection_name,
             "count": collection.count(),
-            "peek": collection.peek(limit=3),
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"index-info failed: {repr(e)}")
 
 
@@ -83,10 +91,19 @@ def index_documents():
 @router.post("/retrieve")
 def retrieve_only(request: ChatRequest):
     try:
-        hits = retrieve_chunks(question=request.question, top_k=request.top_k)
+        hits = retrieve_chunks(
+            question=request.question,
+            top_k=request.top_k,
+            file_name=request.file_name,
+            doc_id=request.doc_id,
+        )
+        confident, reason = is_retrieval_confident(hits)
+
         return {
             "question": request.question,
             "count": len(hits),
+            "confident": confident,
+            "confidence_reason": reason,
             "results": [
                 {
                     "source_id": hit.source_id,
@@ -108,7 +125,12 @@ def retrieve_only(request: ChatRequest):
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     try:
-        return answer_question(question=request.question, top_k=request.top_k)
+        return answer_question(
+            question=request.question,
+            top_k=request.top_k,
+            file_name=request.file_name,
+            doc_id=request.doc_id,
+        )
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"chat failed: {repr(e)}")

@@ -4,8 +4,9 @@ from typing import Any
 from openai import OpenAI
 
 from app.core.config import settings
-from app.schemas.chat import ChatResponse, Citation
-from app.services.indexing import embed_texts, get_chroma_collection
+from app.schemas.chat import ChatResponse, Citation, RetrievedResult
+from app.services.embeddings import embed_texts_local
+from app.services.indexing import get_chroma_collection
 
 
 @dataclass
@@ -20,23 +21,67 @@ class RetrievedChunk:
     metadata: dict[str, Any]
 
 
-def get_openai_client() -> OpenAI:
-    return OpenAI(api_key=settings.openai_api_key)
+def embed_query(question: str) -> list[float]:
+    provider = settings.embedding_provider.lower()
+
+    if provider == "local":
+        return embed_texts_local([question])[0]
+
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is missing.")
+
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.embeddings.create(
+            model=settings.openai_embedding_model,
+            input=[question],
+        )
+        return response.data[0].embedding
+
+    raise ValueError(
+        f"Unsupported embedding provider: {settings.embedding_provider}. "
+        "Use 'local' or 'openai'."
+    )
 
 
-def retrieve_chunks(question: str, top_k: int | None = None) -> list[RetrievedChunk]:
+def build_where_filter(file_name: str | None = None, doc_id: str | None = None):
+    clauses = []
+
+    if file_name:
+        clauses.append({"file_name": file_name})
+    if doc_id:
+        clauses.append({"doc_id": doc_id})
+
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+
+    return {"$and": clauses}
+
+
+def retrieve_chunks(
+    question: str,
+    top_k: int | None = None,
+    file_name: str | None = None,
+    doc_id: str | None = None,
+) -> list[RetrievedChunk]:
     top_k = top_k or settings.retrieval_top_k
-
-    openai_client = get_openai_client()
     collection = get_chroma_collection()
 
-    query_embedding = embed_texts(openai_client, [question])[0]
+    query_embedding = embed_query(question)
+    where_filter = build_where_filter(file_name=file_name, doc_id=doc_id)
 
-    result = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
+    query_kwargs = {
+        "query_embeddings": [query_embedding],
+        "n_results": top_k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+
+    if where_filter:
+        query_kwargs["where"] = where_filter
+
+    result = collection.query(**query_kwargs)
 
     documents = (result.get("documents") or [[]])[0]
     metadatas = (result.get("metadatas") or [[]])[0]
@@ -67,22 +112,18 @@ def retrieve_chunks(question: str, top_k: int | None = None) -> list[RetrievedCh
     return hits
 
 
-def format_context_for_llm(hits: list[RetrievedChunk]) -> str:
-    selected_hits = hits[: settings.generation_max_chunks]
-    blocks: list[str] = []
+def is_retrieval_confident(hits: list[RetrievedChunk]) -> tuple[bool, str | None]:
+    if len(hits) < settings.retrieval_min_results:
+        return False, "沒有檢索到足夠結果"
 
-    for hit in selected_hits:
-        block = (
-            f"[{hit.source_id}]\n"
-            f"Document: {hit.document_title}\n"
-            f"File: {hit.file_name}\n"
-            f"Page: {hit.page_number}\n"
-            f"Chunk ID: {hit.chunk_id}\n"
-            f"Content:\n{hit.text}"
-        )
-        blocks.append(block)
+    best = hits[0]
+    if best.distance is None:
+        return False, "缺少距離資訊"
 
-    return "\n\n---\n\n".join(blocks)
+    if best.distance > settings.retrieval_max_distance:
+        return False, f"最佳結果距離過高（distance={best.distance:.4f}）"
+
+    return True, None
 
 
 def build_citations(hits: list[RetrievedChunk]) -> list[Citation]:
@@ -90,8 +131,8 @@ def build_citations(hits: list[RetrievedChunk]) -> list[Citation]:
 
     for hit in hits[: settings.generation_max_chunks]:
         quote = hit.text.strip().replace("\n", " ")
-        if len(quote) > 160:
-            quote = quote[:160].rstrip() + "..."
+        if len(quote) > settings.citation_quote_max_chars:
+            quote = quote[: settings.citation_quote_max_chars].rstrip() + "..."
 
         citations.append(
             Citation(
@@ -107,51 +148,72 @@ def build_citations(hits: list[RetrievedChunk]) -> list[Citation]:
     return citations
 
 
-def generate_grounded_answer(question: str, hits: list[RetrievedChunk]) -> str:
+def build_retrieval_debug(hits: list[RetrievedChunk]) -> list[RetrievedResult]:
+    debug_rows: list[RetrievedResult] = []
+
+    for hit in hits:
+        debug_rows.append(
+            RetrievedResult(
+                source_id=hit.source_id,
+                chunk_id=hit.chunk_id,
+                document_title=hit.document_title,
+                file_name=hit.file_name,
+                page_number=hit.page_number,
+                distance=hit.distance,
+                text=hit.text,
+            )
+        )
+
+    return debug_rows
+
+
+def generate_grounded_fallback_answer(question: str, hits: list[RetrievedChunk]) -> str:
     if not hits:
         return "目前知識庫中沒有找到可支持回答的內容。"
 
-    context = format_context_for_llm(hits)
-    client = get_openai_client()
+    lines = []
+    for hit in hits[:2]:
+        lines.append(
+            f"根據 {hit.document_title} 第 {hit.page_number} 頁的內容，[{hit.source_id}]：{hit.text}"
+        )
 
-    instructions = (
-        "你是一個只能根據已提供文件內容回答的企業知識助理。\n"
-        "規則：\n"
-        "1. 只能根據提供的 sources 回答。\n"
-        "2. 若證據不足，必須明確說不知道、找不到，不能自行補完。\n"
-        "3. 每個關鍵結論後面都要加上來源標記，例如 [S1]、[S2]。\n"
-        "4. 只能引用已存在的 source labels。\n"
-        "5. 請用繁體中文回答。\n"
-        "6. 不要捏造公司政策、日期、流程或門檻。"
+    return "\n\n".join(lines)
+
+
+def answer_question(
+    question: str,
+    top_k: int | None = None,
+    file_name: str | None = None,
+    doc_id: str | None = None,
+) -> ChatResponse:
+    hits = retrieve_chunks(
+        question=question,
+        top_k=top_k,
+        file_name=file_name,
+        doc_id=doc_id,
     )
 
-    user_input = (
-        f"Question:\n{question}\n\n"
-        f"Sources:\n{context}\n\n"
-        "請根據以上 sources 作答，並在句末附上對應來源標記。"
-    )
-
-    response = client.responses.create(
-        model=settings.chat_model,
-        instructions=instructions,
-        input=user_input,
-        max_output_tokens=settings.generation_max_output_tokens,
-    )
-
-    output_text = getattr(response, "output_text", None)
-    if output_text and output_text.strip():
-        return output_text.strip()
-
-    return "目前無法生成回答，但已成功完成檢索。"
-
-
-def answer_question(question: str, top_k: int | None = None) -> ChatResponse:
-    hits = retrieve_chunks(question=question, top_k=top_k)
-    answer = generate_grounded_answer(question=question, hits=hits)
+    confident, reason = is_retrieval_confident(hits)
     citations = build_citations(hits)
+    retrieval_debug = build_retrieval_debug(hits)
+
+    if not confident:
+        return ChatResponse(
+            answer="目前知識庫沒有足夠證據支持明確回答。",
+            citations=citations,
+            retrieved_count=len(hits),
+            abstained=True,
+            abstain_reason=reason,
+            retrieval_debug=retrieval_debug,
+        )
+
+    answer = generate_grounded_fallback_answer(question, hits)
 
     return ChatResponse(
         answer=answer,
         citations=citations,
         retrieved_count=len(hits),
+        abstained=False,
+        abstain_reason=None,
+        retrieval_debug=retrieval_debug,
     )

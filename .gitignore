@@ -1,21 +1,28 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Virtual env
+# Virtual environment
 .venv/
+venv/
+env/
 
-# Environment
+# Environment variables
 .env
+
+# Cache / test
+.pytest_cache/
+.mypy_cache/
+.coverage
 
 # macOS
 .DS_Store
 
-# Chroma / local data
+# Local vector DB / generated data
 chroma_db/
 data/processed/
 
-# Pytest
-.pytest_cache/
+# IDE
+.vscode/
+.idea/
